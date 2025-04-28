@@ -7,7 +7,7 @@ class AudioStreamer: ObservableObject {
     private var udpConnection: NWConnection?
     private let streamingQueue = DispatchQueue(label: "AudioStreamingQueue") // for throttling
 
-    private let espIP = "10.0.0.12"
+    private let espIP = "10.0.1.2"
     private let espPort: NWEndpoint.Port = 12345
 
     @Published var isStreaming = false
@@ -37,70 +37,59 @@ class AudioStreamer: ObservableObject {
     private func configureAndStart() {
         guard !isStreaming else { return }
         isStreaming = true
-
         let audioSession = AVAudioSession.sharedInstance()
         do {
             try audioSession.setCategory(.playAndRecord, mode: .default)
-            try audioSession.setPreferredSampleRate(48000)
             try audioSession.setActive(true)
         } catch {
             print("AudioSession error: \(error)")
             return
         }
-
+        
         let inputFormat = engine.inputNode.inputFormat(forBus: 0)
         print("Input format: \(inputFormat)")
-
         setupUDP()
-
+        
+        // Use smaller buffer for more frequent updates
         let bufferSize: AVAudioFrameCount = 256
+        
+        // var packetCount = 0
+        
         engine.inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { buffer, _ in
             guard let udpConnection = self.udpConnection else { return }
 
-            // Max frame limit
-            let maxFrames = 256
-            let actualFrameLength = Int(buffer.frameLength)
-            let frameLength = min(actualFrameLength, maxFrames)
-            print("Tapped buffer frameLength: \(actualFrameLength), using: \(frameLength)")
+            let frameLength = Int(buffer.frameLength)
 
-            // Get float32 channels
-            let floatLeft = buffer.floatChannelData?[0]
-            let floatRight = buffer.format.channelCount > 1 ? buffer.floatChannelData?[1] : nil
+            guard let floatChannelData = buffer.floatChannelData else { return }
+            let monoChannel = floatChannelData[0]
 
-            // Prepare interleaved Int16 buffer
-            var interleavedData = Data(capacity: frameLength * 4) // 2 channels * 2 bytes
+            // We need to collect enough samples to make exactly 1024 bytes per packet
+            var interleavedData = Data(capacity: 1024)
 
             for i in 0..<frameLength {
-                let l = floatLeft?[i] ?? 0
-                let r = floatRight?[i] ?? l // fallback to mono
+                let sample = monoChannel[i]
+                let clampedSample = max(-1.0, min(1.0, sample))
+                let int16Sample = Int16(clampedSample * 32767)
 
-                let leftSample = Int16(max(-1.0, min(1.0, l)) * Float(Int16.max))
-                let rightSample = Int16(max(-1.0, min(1.0, r)) * Float(Int16.max))
+                interleavedData.append(contentsOf: withUnsafeBytes(of: int16Sample.littleEndian) { Data($0) })
+                interleavedData.append(contentsOf: withUnsafeBytes(of: int16Sample.littleEndian) { Data($0) })
 
-                interleavedData.append(contentsOf: withUnsafeBytes(of: leftSample.littleEndian) { Data($0) })
-                interleavedData.append(contentsOf: withUnsafeBytes(of: rightSample.littleEndian) { Data($0) })
-            }
+                // Once we have enough, send it
+                if interleavedData.count >= 1024 {
+                    let packet = interleavedData.prefix(1024)
+                    interleavedData.removeFirst(1024)
 
-            // Clamp to max 1024 bytes
-            let maxPacketSize = 1024
-            if interleavedData.count > maxPacketSize {
-                print("Clamping packet from \(interleavedData.count) to \(maxPacketSize) bytes")
-                interleavedData = interleavedData.prefix(maxPacketSize)
-            }
-
-            print("Sending \(interleavedData.count) bytes. First samples: \(interleavedData.prefix(8).map { String(format: "%02x", $0) })")
-
-            self.streamingQueue.asyncAfter(deadline: .now()) {
-                udpConnection.send(content: interleavedData, completion: .contentProcessed({ error in
-                    if let error = error {
-                        print("UDP send error: \(error)")
-                    } else {
-                        print("Audio packet sent to ESP.")
+                    self.streamingQueue.async {
+                        udpConnection.send(content: packet, completion: .contentProcessed({ error in
+                            if let error = error {
+                                print("UDP send error: \(error)")
+                            }
+                        }))
                     }
-                }))
+                }
             }
         }
-
+        
         do {
             try engine.start()
             print("Audio engine started.")
@@ -108,7 +97,6 @@ class AudioStreamer: ObservableObject {
             print("Failed to start audio engine: \(error)")
         }
     }
-
     // */
 
     private func setupUDP() {
