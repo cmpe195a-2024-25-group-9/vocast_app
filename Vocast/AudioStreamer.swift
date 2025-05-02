@@ -7,11 +7,19 @@ class AudioStreamer: ObservableObject {
     private var udpConnection: NWConnection?
     private let streamingQueue = DispatchQueue(label: "audio.streaming.queue") // for throttling
 
-    private let espIP = "10.0.0.12"
+    private var espIP: String
     private let espPort: NWEndpoint.Port = 12345
 
     @Published var isStreaming = false
 
+    init(espIP: String) {
+        self.espIP = espIP
+    }
+    
+    func updateIP(to newIP: String) {
+        self.espIP = newIP
+    }
+    
     func startStreaming() {
         checkMicrophoneAccess { granted in
             if granted {
